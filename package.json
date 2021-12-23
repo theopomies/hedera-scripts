@@ -1,0 +1,11 @@
+{
+  "name": "nft",
+  "version": "1.0.0",
+  "main": "index.js",
+  "license": "MIT",
+  "dependencies": {
+    "@hashgraph/sdk": "^2.7.0-beta.2",
+    "dotenv": "^10.0.0",
+    "typescript": "^4.5.4"
+  }
+}
