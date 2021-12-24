@@ -2,17 +2,20 @@ import {
   AccountId,
   CustomRoyaltyFee,
   Key,
-  NftId,
   PrivateKey,
   Status,
   Timestamp,
+  TokenBurnTransaction,
   TokenCreateTransaction,
   TokenId,
+  TokenInfoQuery,
   TokenMintTransaction,
   TokenSupplyType,
   TokenType,
   TransferTransaction,
+  Hbar,
 } from "@hashgraph/sdk";
+import { BigNumber } from "@hashgraph/sdk/lib/Transfer";
 import { client } from "./client";
 
 const DEFAULT_INITIAL_SUPPLY = 0;
@@ -98,39 +101,51 @@ export async function createNft(
  * createNft in params
  */
 export function createRoyalty(
-  receiver: AccountId,
+  receiver: string | AccountId,
   percentage: number
 ): CustomRoyaltyFee {
   return new CustomRoyaltyFee()
     .setNumerator(percentage * 100)
-    .setDenominator(10000)
+    .setDenominator(10_000)
     .setFeeCollectorAccountId(receiver);
+}
+
+export interface MintNftOptions {
+  metadata?: Uint8Array;
+  transferOptions?: {
+    to: string | AccountId;
+    treasury: { accountId: string | AccountId; privateKey: PrivateKey };
+  };
 }
 
 export async function mintNft(
   tokenId: string | TokenId,
   supplyPrivateKey: PrivateKey,
-  metadata: Uint8Array,
-  transferOptions?: {
-    to: string | AccountId;
-    from: { accountId: string | AccountId; privateKey: PrivateKey };
-  }
+  options?: MintNftOptions
 ): Promise<number> {
+  const { metadata, transferOptions } = options ?? {};
+
   const tx = new TokenMintTransaction()
     .setTokenId(tokenId)
-    .setMetadata(metadata ? [metadata] : [])
+    .setMetadata(metadata != undefined ? [metadata] : [Buffer.from("")])
     .freezeWith(client);
   const signTx = await tx.sign(supplyPrivateKey);
   const txResponse = await signTx.execute(client);
   const txReceipt = await txResponse.getReceipt(client);
   const serial = txReceipt.serials[0].low;
+
   if (transferOptions == undefined) return serial;
 
-  await transferNft(tokenId, serial, transferOptions.from, transferOptions.to);
+  await transferNftWithoutFees(
+    tokenId,
+    serial,
+    transferOptions.treasury,
+    transferOptions.to
+  );
   return serial;
 }
 
-export async function transferNft(
+export async function transferNftWithoutFees(
   tokenId: string | TokenId,
   serial: number,
   sender: { accountId: string | AccountId; privateKey: PrivateKey },
@@ -139,6 +154,62 @@ export async function transferNft(
   const tx = new TransferTransaction()
     .addNftTransfer(tokenId, serial, sender.accountId, recipient)
     .freezeWith(client);
+  const signTx = await tx.sign(sender.privateKey);
+  const txResponse = await signTx.execute(client);
+  const txReceipt = await txResponse.getReceipt(client);
+  return txReceipt.status;
+}
+
+export async function burnNftFromTreasury(
+  tokenId: string | TokenId,
+  serial: number,
+  supplyKey: PrivateKey
+): Promise<Status> {
+  const tx = new TokenBurnTransaction()
+    .setTokenId(tokenId)
+    .setSerials([serial])
+    .freezeWith(client);
+
+  const signTx = await tx.sign(supplyKey);
+  const txResponse = await signTx.execute(client);
+  const txReceipt = await txResponse.getReceipt(client);
+  return txReceipt.status;
+}
+
+export async function burnNft(
+  tokenId: string | TokenId,
+  serial: number,
+  supplyKey: PrivateKey,
+  owner: { accountId: string | AccountId; privateKey: PrivateKey }
+): Promise<Status> {
+  const query = new TokenInfoQuery().setTokenId(tokenId);
+  const treasury = (await query.execute(client)).treasuryAccountId;
+  if (treasury == null) throw new Error("No treasury account id found.");
+
+  await transferNftWithoutFees(tokenId, serial, owner, treasury);
+
+  return burnNftFromTreasury(tokenId, serial, supplyKey);
+}
+
+export async function transferNft(
+  tokenId: string | TokenId,
+  serial: number,
+  amount: string | number | Long.Long | BigNumber | Hbar,
+  sender: { accountId: string | AccountId; privateKey: PrivateKey },
+  recipient: { accountId: string | AccountId; privateKey: PrivateKey }
+): Promise<Status> {
+  const negAmount = (() => {
+    if (typeof amount == "number" || typeof amount == "string") return -amount;
+    if ("negate" in amount) return amount.negate();
+    return amount.negated();
+  })();
+
+  const tx = await new TransferTransaction()
+    .addNftTransfer(tokenId, serial, sender.accountId, recipient.accountId)
+    .addHbarTransfer(sender.accountId, amount)
+    .addHbarTransfer(recipient.accountId, negAmount)
+    .freezeWith(client)
+    .sign(recipient.privateKey);
   const signTx = await tx.sign(sender.privateKey);
   const txResponse = await signTx.execute(client);
   const txReceipt = await txResponse.getReceipt(client);
