@@ -1,3 +1,4 @@
+import { PublicKey } from "@hashgraph/cryptography";
 import {
   AccountId,
   CustomRoyaltyFee,
@@ -14,9 +15,20 @@ import {
   TokenType,
   TransferTransaction,
   Hbar,
+  ScheduleCreateTransaction,
+  ScheduleSignTransaction,
+  TopicCreateTransaction,
+  TopicId,
+  TopicMessageSubmitTransaction,
+  TopicMessageQuery,
+  FileCreateTransaction,
+  FileId,
+  FileContentsQuery,
 } from "@hashgraph/sdk";
 import { BigNumber } from "@hashgraph/sdk/lib/Transfer";
-import { client } from "./client";
+import axios from "axios";
+import { Base64 } from "js-base64";
+import { client, mirror } from "./client";
 
 const DEFAULT_INITIAL_SUPPLY = 0;
 const NFT_DECIMALS = 0;
@@ -34,8 +46,28 @@ export interface CreateNftOptions {
   expirationTime?: Timestamp | Date;
   feeScheduleKey?: Key;
   maxSupply?: number | Long.Long;
-  memo?: string;
   royalties?: CustomRoyaltyFee[];
+
+  firstSaleRoyalties?: RoyaltyFee[];
+  usageRoyalties?: RoyaltyFee[];
+  description?: string;
+}
+
+export interface RoyaltyFee {
+  receiver: string;
+  percentage: number;
+}
+
+export interface TokenClassMetadata {
+  name: string;
+  description: string;
+  firstSaleRoyalties: RoyaltyFee[];
+  usageRoyalties: RoyaltyFee[];
+}
+
+export interface TokenClassMemo {
+  topicId: string;
+  sequenceNumber: number;
 }
 
 export async function createNft(
@@ -54,9 +86,31 @@ export async function createNft(
     expirationTime,
     feeScheduleKey,
     maxSupply,
-    memo,
     royalties,
+    firstSaleRoyalties,
+    usageRoyalties,
+    description,
   } = options ?? {};
+
+  let msg: TokenClassMetadata = {
+    name,
+    description: description ?? "",
+    firstSaleRoyalties: firstSaleRoyalties ?? [],
+    usageRoyalties: usageRoyalties ?? [],
+  };
+  const topic = await createTopic();
+  if (!topic) {
+    console.error("Couldn't create topic.");
+    return null;
+  }
+
+  const sequenceNumber = await storeMsgInTopic(topic, JSON.stringify(msg));
+  if (!sequenceNumber) throw new Error("Sequence number returned null.");
+
+  const memo: TokenClassMemo = {
+    topicId: topic.toString(),
+    sequenceNumber,
+  };
 
   let tx = new TokenCreateTransaction()
     .setTokenName(name)
@@ -65,7 +119,8 @@ export async function createNft(
     .setTokenType(TokenType.NonFungibleUnique)
     .setDecimals(NFT_DECIMALS)
     .setInitialSupply(DEFAULT_INITIAL_SUPPLY)
-    .setSupplyKey(supplyKey ?? treasury.privateKey);
+    .setSupplyKey(supplyKey ?? treasury.privateKey)
+    .setTokenMemo(JSON.stringify(memo));
 
   if (admin != undefined) tx = tx.setAdminKey(admin.adminPublicKey);
   if (kycKey != undefined) tx = tx.setKycKey(kycKey);
@@ -76,7 +131,6 @@ export async function createNft(
   if (feeScheduleKey != undefined) tx = tx.setFeeScheduleKey(feeScheduleKey);
   if (maxSupply != undefined)
     tx = tx.setSupplyType(TokenSupplyType.Finite).setMaxSupply(maxSupply);
-  if (memo != undefined) tx = tx.setTokenMemo(memo);
   if (royalties != undefined) tx = tx.setCustomFees(royalties);
 
   const frozenTx = tx.freezeWith(client);
@@ -214,4 +268,112 @@ export async function transferNft(
   const txResponse = await signTx.execute(client);
   const txReceipt = await txResponse.getReceipt(client);
   return txReceipt.status;
+}
+
+// TODO: Scheduled tx
+export async function scheduleNftTransfer(
+  tokenId: string | TokenId,
+  serial: number,
+  amount: string | number | Long.Long | BigNumber | Hbar,
+  sender: string | AccountId,
+  recipient: string | AccountId,
+  signer: PrivateKey
+): Promise<Status> {
+  const negAmount = (() => {
+    if (typeof amount == "number" || typeof amount == "string") return -amount;
+    if ("negate" in amount) return amount.negate();
+    return amount.negated();
+  })();
+
+  const tx = new TransferTransaction()
+    .addNftTransfer(tokenId, serial, sender, recipient)
+    .addHbarTransfer(sender, amount)
+    .addHbarTransfer(recipient, negAmount);
+  const scheduledTx = await new ScheduleCreateTransaction()
+    .setScheduledTransaction(tx)
+    .freezeWith(client)
+    .sign(signer);
+  const txResponse = await scheduledTx.execute(client);
+  try {
+    const txReceipt = await txResponse.getReceipt(client);
+    return txReceipt.status;
+  } catch (e: any) {
+    if (e?.status != Status.IdenticalScheduleAlreadyCreated) throw e;
+    const tx = await new ScheduleSignTransaction()
+      .setScheduleId(e.transactionReceipt.scheduleId)
+      .freezeWith(client)
+      .sign(signer);
+    const txResponse = await tx.execute(client);
+    const txReceipt = await txResponse.getReceipt(client);
+    return txReceipt.status;
+  }
+}
+
+export async function createTopic(): Promise<TopicId | null> {
+  const tx = new TopicCreateTransaction()
+    .setSubmitKey(PrivateKey.fromString(process.env.ADMIN_ACCOUNT_PRIVATE_KEY!))
+    .freezeWith(client);
+  const txResponse = await tx.execute(client);
+  const receipt = await txResponse.getReceipt(client);
+  const topicId = receipt.topicId;
+  return topicId;
+}
+
+export async function storeMsgInTopic(
+  topicId: TopicId,
+  msg: string
+): Promise<number | null> {
+  const tx = new TopicMessageSubmitTransaction()
+    .setTopicId(topicId)
+    .setMessage(msg)
+    .freezeWith(client);
+  const txResponse = await tx.execute(client);
+  const txReceipt = await txResponse.getReceipt(client);
+  return txReceipt.topicSequenceNumber?.toNumber() ?? null;
+}
+
+export async function readTopicMsg(
+  topic: TopicId,
+  sequenceNumber: number
+): Promise<string> {
+  return Base64.decode(
+    (
+      await axios.get(
+        `${mirror}/topics/${topic.toString()}/messages/${sequenceNumber}`
+      )
+    ).data.message
+  );
+}
+
+export async function storeMsgInFile(msg: string): Promise<FileId | null> {
+  const key = PrivateKey.fromString(process.env.ADMIN_ACCOUNT_PRIVATE_KEY!);
+  const tx = new FileCreateTransaction()
+    .setKeys([key])
+    .setContents(msg)
+    .freezeWith(client);
+  const signTx = await tx.sign(key);
+  const submitTx = await signTx.execute(client);
+  const receipt = await submitTx.getReceipt(client);
+  return receipt.fileId;
+}
+
+export async function readMsgFromFile(file: FileId): Promise<string> {
+  const key = PrivateKey.fromString(process.env.ADMIN_ACCOUNT_PRIVATE_KEY!);
+  const query = new FileContentsQuery().setFileId(file);
+  return (await query.execute(client)).toString();
+}
+
+export async function getTokenClassMetadata(
+  tokenId: TokenId
+): Promise<TokenClassMetadata> {
+  // Retrieve TopicId / SequenceNumber from tokenId
+  const query = new TokenInfoQuery().setTokenId(tokenId);
+  const response = await query.execute(client);
+  const { topicId, sequenceNumber } = JSON.parse(
+    response.tokenMemo
+  ) as TokenClassMemo;
+
+  return JSON.parse(
+    await readTopicMsg(TopicId.fromString(topicId), sequenceNumber)
+  );
 }

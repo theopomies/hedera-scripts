@@ -60,21 +60,15 @@ export async function autoAssociateAccount(
 }
 
 export async function balanceChecker(
-  treasuryAccountId: string | AccountId,
-  firstBuyerAccountId: string | AccountId,
-  secondBuyerAccountId: string | AccountId,
-  tokenId: TokenId
+  tokenId: TokenId,
+  ...accountIds: (string | AccountId)[]
 ) {
-  const [b1, b11] = await getAccountBalance(treasuryAccountId, tokenId);
-  const [b2, b22] = await getAccountBalance(firstBuyerAccountId, tokenId);
-  const [b3, b33] = await getAccountBalance(secondBuyerAccountId, tokenId);
-  console.log(
-    `Nft count for treasury: ${b1?.toString()}; Hbar balance: ${b11.toString()}.`
-  );
-  console.log(
-    `Nft count for firstBuyer: ${b2?.toString()}; Hbar balance: ${b22.toString()}.`
-  );
-  console.log(
-    `Nft count for secondBuyer: ${b3?.toString()}; Hbar balance: ${b33.toString()}.`
-  );
+  if (accountIds.length == 0) return;
+  const balancePromises = accountIds.map((accountId => getAccountBalance(accountId, tokenId)));
+  const balances = await Promise.all(balancePromises);
+  balances.forEach(([nftCount, hbar]) => {
+    console.log(
+      `Nft count for treasury: ${nftCount?.toString() ?? 0}; Hbar balance: ${hbar.toString()}.`
+    );
+  })
 }

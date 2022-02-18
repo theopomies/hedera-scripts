@@ -19,3 +19,5 @@ function newClient(): Client {
   );
   return client;
 }
+
+export const mirror = "https://testnet.mirrornode.hedera.com/api/v1";
